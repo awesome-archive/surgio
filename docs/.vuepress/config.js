@@ -7,6 +7,13 @@ module.exports = {
     }
   },
   themeConfig: {
+    algolia: {
+      apiKey: '6e7242cfd891a169eb12749ab473ba8f',
+      indexName: 'surgio',
+    },
+    markdown: {
+      lineNumbers: true
+    },
     nav: [
       {
         text: 'Changelog',
@@ -35,6 +42,26 @@ module.exports = {
                 'custom-artifact',
               ]
             },
+            {
+              title: '客户端规则维护指南',
+              collapsable: false,
+              children: [
+                'client/clash',
+              ]
+            },
+            'api',
+            '0.x-to-1.0',
+          ]
+        },
+        {
+          title: '进阶',
+          collapsable: false,
+          children: [
+            'advance/surge-advance',
+            'advance/custom-filter',
+            'advance/automation',
+            'advance/api-gateway',
+            ['https://blog.dada.li/2019/better-proxy-rules-for-apple-services', '苹果服务的连接策略推荐']
           ]
         },
       ],
@@ -45,7 +72,13 @@ module.exports = {
       '@vuepress/google-analytics',
       {
         'ga': 'UA-146417304-1'
-      }
-    ]
+      },
+    ],
+    [
+      'vuepress-plugin-sitemap',
+      {
+        hostname: 'https://surgio.royli.dev',
+      },
+    ],
   ]
 };

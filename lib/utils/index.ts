@@ -1,18 +1,20 @@
 import assert from 'assert';
-import axios from 'axios';
-import flag from 'country-code-emoji';
-import fs from 'fs';
+import chalk from 'chalk';
+import Debug from 'debug';
+import fs from 'fs-extra';
+import got from 'got';
 import _ from 'lodash';
 import LRU from 'lru-cache';
+import os from 'os';
 import path from 'path';
-import URL from 'url';
 import queryString from 'query-string';
 import { JsonObject } from 'type-fest';
+import { default as legacyUrl } from 'url';
 import URLSafeBase64 from 'urlsafe-base64';
 import YAML from 'yaml';
+
 import {
-  BlackSSLProviderConfig,
-  CommandConfig,
+  HttpNodeConfig,
   HttpsNodeConfig,
   NodeFilterType,
   NodeNameFilterType,
@@ -20,75 +22,103 @@ import {
   PlainObjectOf,
   PossibleNodeConfigType,
   ProxyGroupModifier,
-  RemoteSnippet,
-  RemoteSnippetConfig,
   ShadowsocksNodeConfig,
   ShadowsocksrNodeConfig,
   SimpleNodeConfig,
   SnellNodeConfig,
+  SortedNodeNameFilterType,
   VmessNodeConfig,
 } from '../types';
+import { NETWORK_TIMEOUT, OBFS_UA, PROVIDER_CACHE_MAXAGE, PROXY_TEST_INTERVAL, PROXY_TEST_URL } from './constant';
+import { validateFilter } from './filter';
+import { parseSSRUri } from './ssr';
+import { formatVmessUri } from './v2ray';
 
-const ConfigCache = new LRU<string, any>({
-  maxAge: 10 * 60 * 1000, // 10min
+const debug = Debug('surgio:utils');
+
+export const ConfigCache = new LRU<string, string>({
+  maxAge: PROVIDER_CACHE_MAXAGE,
 });
 
-export const resolveRoot = (...args: readonly string[]): string => path.resolve(__dirname, '../../', ...args);
+// istanbul ignore next
+export const resolveRoot = (...args: readonly string[]): string =>
+  path.join(__dirname, '../../', ...args);
 
-export const getDownloadUrl = (baseUrl: string = '/', artifactName: string): string => `${baseUrl}${artifactName}`;
+export const getDownloadUrl = (baseUrl: string = '/', artifactName: string, inline: boolean = true, accessToken?: string): string => {
+  const urlObject = legacyUrl.parse(`${baseUrl}${artifactName}`, true);
 
-export const getBlackSSLConfig = async (config: BlackSSLProviderConfig): Promise<ReadonlyArray<HttpsNodeConfig>> => {
-  assert(config.username, 'Lack of BlackSSL username.');
-  assert(config.password, 'Lack of BlackSSL password.');
+  if (accessToken) {
+    urlObject.query.access_token = accessToken;
+  }
 
-  const key = `blackssl_${config.username}`;
+  if (!inline) {
+    urlObject.query.dl = '1';
+  }
 
-  async function requestConfigFromBlackSSL(username: string, password: string): Promise<ReadonlyArray<HttpsNodeConfig>> {
-    const response = await axios
-      .get('https://api.darkssl.com/v1/service/ssl_info', {
-        params: {
-          username,
-          password,
-        },
-        timeout: 20000,
-        proxy: false,
-        headers: {
-          'User-Agent': 'GoAgentX/774 CFNetwork/901.1 Darwin/17.6.0 (x86_64)',
-        },
-      });
+  // tslint:disable-next-line:no-delete
+  delete urlObject.search;
 
-    const result = (response.data.ssl_nodes as readonly any[]).map<HttpsNodeConfig>(item => ({
-      nodeName: `${flag(item.country_code as string)}${item.name as string}`,
+  return legacyUrl.format(urlObject);
+};
+
+// istanbul ignore next
+export const getBlackSSLConfig = async (username: string, password: string): Promise<ReadonlyArray<HttpsNodeConfig>> => {
+  assert(username, 'Lack of BlackSSL username.');
+  assert(password, 'Lack of BlackSSL password.');
+
+  const key = `blackssl_${username}`;
+
+  async function requestConfigFromBlackSSL(): Promise<ReadonlyArray<HttpsNodeConfig>> {
+    const response = ConfigCache.has(key) ? JSON.parse(ConfigCache.get(key)) : await (async () => {
+      const res = await got
+        .get('https://api.darkssl.com/v1/service/ssl_info', {
+          responseType: 'text',
+          searchParams: {
+            username,
+            password,
+          },
+          timeout: NETWORK_TIMEOUT,
+          headers: {
+            'User-Agent': 'GoAgentX/774 CFNetwork/901.1 Darwin/17.6.0 (x86_64)',
+          },
+        });
+
+      ConfigCache.set(key, res.body);
+
+      return JSON.parse(res.body);
+    })();
+
+    return (response.ssl_nodes as readonly any[]).map<HttpsNodeConfig>(item => ({
+      nodeName: item.name,
       type: NodeTypeEnum.HTTPS,
-      hostname: item.server as string,
-      port: item.port as string,
+      hostname: item.server,
+      port: item.port,
       username,
       password,
     }));
-
-    ConfigCache.set(key, result);
-
-    return result;
   }
 
-  return ConfigCache.has(key) ?
-    ConfigCache.get(key) :
-    await requestConfigFromBlackSSL(config.username, config.password);
+  return await requestConfigFromBlackSSL();
 };
 
-export const getShadowsocksJSONConfig = async (config: {
-  readonly url: string,
-  readonly udpRelay?: boolean,
-}): Promise<ReadonlyArray<ShadowsocksNodeConfig>> => {
-  assert(config.url, 'Lack of subscription url.');
+export const getShadowsocksJSONConfig = async (
+  url: string,
+  udpRelay?: boolean,
+): Promise<ReadonlyArray<ShadowsocksNodeConfig>> => {
+  assert(url, '未指定订阅地址 url');
 
-  async function requestConfigFromRemote(url: string): Promise<ReadonlyArray<ShadowsocksNodeConfig>> {
-    const response = await axios.get(url, {
-      proxy: false,
-      timeout: 20000,
-    });
+  async function requestConfigFromRemote(): Promise<ReadonlyArray<ShadowsocksNodeConfig>> {
+    const response = ConfigCache.has(url) ? JSON.parse(ConfigCache.get(url)) : await (async () => {
+      const res = await got.get(url, {
+        timeout: NETWORK_TIMEOUT,
+      });
 
-    const result = (response.data.configs as readonly any[]).map<ShadowsocksNodeConfig>(item => {
+      ConfigCache.set(url, res.body);
+
+      return JSON.parse(res.body);
+    })();
+
+    return (response.configs as readonly any[]).map<ShadowsocksNodeConfig>(item => {
       const nodeConfig: any = {
         nodeName: item.remarks as string,
         type: NodeTypeEnum.Shadowsocks,
@@ -98,8 +128,8 @@ export const getShadowsocksJSONConfig = async (config: {
         password: item.password as string,
       };
 
-      if (typeof config.udpRelay === 'boolean') {
-        nodeConfig['udp-relay'] = config.udpRelay ? 'true' : 'false';
+      if (typeof udpRelay === 'boolean') {
+        nodeConfig['udp-relay'] = udpRelay;
       }
       if (item.plugin === 'obfs-local') {
         const obfs = item.plugin_opts.match(/obfs=(\w+)/);
@@ -113,35 +143,39 @@ export const getShadowsocksJSONConfig = async (config: {
 
       return nodeConfig;
     });
-
-    ConfigCache.set(url, result);
-
-    return result;
   }
 
-  return ConfigCache.has(config.url) ?
-    ConfigCache.get(config.url) :
-    await requestConfigFromRemote(config.url);
+  return await requestConfigFromRemote();
 };
 
-export const getShadowsocksSubscription = async (config: {
-  readonly url: string;
-  readonly udpRelay?: boolean;
-}): Promise<ReadonlyArray<ShadowsocksNodeConfig>> => {
-  assert(config.url, 'Lack of subscription url.');
+/**
+ * @see https://shadowsocks.org/en/spec/SIP002-URI-Scheme.html
+ */
+export const getShadowsocksSubscription = async (
+  url: string,
+  udpRelay?: boolean,
+): Promise<ReadonlyArray<ShadowsocksNodeConfig>> => {
+  assert(url, '未指定订阅地址 url');
 
-  async function requestConfigFromRemote(url: string): Promise<ReadonlyArray<ShadowsocksNodeConfig>> {
-    const response = await axios.get(url, {
-      proxy: false,
-      timeout: 20000,
-      responseType: 'text',
-    });
+  async function requestConfigFromRemote(): Promise<ReadonlyArray<ShadowsocksNodeConfig>> {
+    const response = ConfigCache.has(url) ? ConfigCache.get(url) : await (async () => {
+      const res = await got.get(url, {
+        timeout: NETWORK_TIMEOUT,
+      });
 
-    const configList = fromBase64(response.data).split('\n').filter(item => !!item);
-    const result = configList.map<any>(item => {
-      const scheme = URL.parse(item, true);
+      ConfigCache.set(url, res.body);
+
+      return res.body;
+    })();
+
+    const configList = fromBase64(response).split('\n')
+      .filter(item => !!item && item.startsWith("ss://"));
+
+    return configList.map<any>(item => {
+      debug('SS URI', item);
+      const scheme = legacyUrl.parse(item, true);
       const userInfo = fromUrlSafeBase64(scheme.auth).split(':');
-      const pluginInfo = typeof scheme.query.plugin === 'string' ? decodeStringList<any>(scheme.query.plugin.split(';')) : {};
+      const pluginInfo = typeof scheme.query.plugin === 'string' ? decodeStringList(scheme.query.plugin.split(';')) : {};
 
       return {
         type: NodeTypeEnum.Shadowsocks,
@@ -150,44 +184,92 @@ export const getShadowsocksSubscription = async (config: {
         port: scheme.port,
         method: userInfo[0],
         password: userInfo[1],
-        ...(typeof config.udpRelay === 'boolean' ? {
-          'udp-relay': config.udpRelay ? 'true' : 'false',
+        ...(typeof udpRelay === 'boolean' ? {
+          'udp-relay': udpRelay,
         } : null),
         ...(pluginInfo['obfs-local'] ? {
           obfs: pluginInfo.obfs,
           'obfs-host': pluginInfo['obfs-host'],
         } : null),
+        ...(pluginInfo['v2ray-plugin'] ? {
+          obfs: pluginInfo.tls ? 'wss' : 'ws',
+          'obfs-host': pluginInfo.host,
+        } : null),
       };
     });
-
-    ConfigCache.set(url, result);
-
-    return result;
   }
 
-  return ConfigCache.has(config.url) ?
-    ConfigCache.get(config.url) :
-    await requestConfigFromRemote(config.url);
+  return await requestConfigFromRemote();
 };
 
-export const getV2rayNSubscription = async (config: {
-  readonly url: string,
-}): Promise<ReadonlyArray<VmessNodeConfig>> => {
-  assert(config.url, 'Lack of subscription url.');
+export const getShadowsocksrSubscription = async (
+  url: string,
+  udpRelay?: boolean,
+): Promise<ReadonlyArray<ShadowsocksrNodeConfig>> => {
+  assert(url, '未指定订阅地址 url');
 
-  async function requestConfigFromRemote(url: string): Promise<ReadonlyArray<VmessNodeConfig>> {
-    const response = await axios.get(url, {
-      proxy: false,
-      timeout: 20000,
-      responseType: 'text',
+  async function requestConfigFromRemote(): Promise<ReadonlyArray<ShadowsocksrNodeConfig>> {
+    const response = ConfigCache.has(url) ? ConfigCache.get(url) : await (async () => {
+      const res = await got.get(url, {
+        timeout: NETWORK_TIMEOUT,
+      });
+
+      ConfigCache.set(url, res.body);
+
+      return res.body;
+    })();
+
+    const configList = fromBase64(response)
+      .split('\n')
+      .filter(item => !!item && item.startsWith("ssr://"));
+
+    return configList.map<ShadowsocksrNodeConfig>(str => {
+      const nodeConfig = parseSSRUri(str);
+
+      if (udpRelay !== void 0) {
+        (nodeConfig['udp-relay'] as boolean) = udpRelay;
+      }
+
+      return nodeConfig;
     });
+  }
 
-    const configList = fromBase64(response.data).split('\n').filter(item => !!item);
-    const result = configList.map<VmessNodeConfig>(item => {
+  return await requestConfigFromRemote();
+};
+
+export const getV2rayNSubscription = async (
+  url: string,
+): Promise<ReadonlyArray<VmessNodeConfig>> => {
+  assert(url, '未指定订阅地址 url');
+
+  async function requestConfigFromRemote(): Promise<ReadonlyArray<VmessNodeConfig>> {
+    const response = ConfigCache.has(url) ? ConfigCache.get(url) : await (async () => {
+      const res = await got.get(url, {
+        timeout: NETWORK_TIMEOUT,
+      });
+
+      ConfigCache.set(url, res.body);
+
+      return res.body;
+    })();
+
+    const configList = fromBase64(response).split('\n')
+        .filter(item => !!item)
+        .filter(item => item.startsWith("vmess://"));
+
+    return configList.map<VmessNodeConfig>(item => {
       const json = JSON.parse(fromBase64(item.replace('vmess://', '')));
 
-      if (json.v !== '2') {
-        throw new Error(`暂不支持该订阅类型：${url}`);
+      // istanbul ignore next
+      if (!json.v || Number(json.v) !== 2) {
+        throw new Error(`该订阅 ${url} 可能不是一个有效的 V2rayN 订阅。请参考 http://bit.ly/2N4lZ8X 进行排查`);
+      }
+
+      // istanbul ignore next
+      if (['kcp', 'http'].indexOf(json.net) > -1) {
+        console.log();
+        console.log(chalk.yellow(`不支持读取 network 类型为 ${json.net} 的 Vmess 节点，节点 ${json.ps} 会被省略`));
+        return null;
       }
 
       return {
@@ -203,31 +285,47 @@ export const getV2rayNSubscription = async (config: {
         host: json.host || '',
         path: json.path || '/',
       };
-    });
-
-    ConfigCache.set(url, result);
-
-    return result;
+    })
+      .filter(item => !!item);
   }
 
-  return ConfigCache.has(config.url) ?
-    ConfigCache.get(config.url) :
-    await requestConfigFromRemote(config.url);
+  return await requestConfigFromRemote();
 };
 
 export const getSurgeNodes = (
-  list: ReadonlyArray<HttpsNodeConfig | ShadowsocksNodeConfig | SnellNodeConfig>,
-  filter?: NodeFilterType,
+  list: ReadonlyArray<HttpsNodeConfig|HttpNodeConfig|ShadowsocksNodeConfig|SnellNodeConfig|ShadowsocksrNodeConfig|VmessNodeConfig>,
+  filter?: NodeFilterType|SortedNodeNameFilterType,
 ): string => {
-  const result: string[] = list
-    .filter(item => filter ? filter(item) : true)
+  const result: string[] = applyFilter(list, filter)
     .map<string>(nodeConfig => {
-      if (nodeConfig.enable === false) { return null; }
-
       switch (nodeConfig.type) {
         case NodeTypeEnum.Shadowsocks: {
           const config = nodeConfig as ShadowsocksNodeConfig;
 
+          if (['ws', 'wss'].includes(config.obfs)) {
+            console.log();
+            console.log(chalk.yellow(`不支持为 Surge 生成 v2ray-plugin 的 Shadowsocks 节点，节点 ${nodeConfig!.nodeName} 会被省略`));
+            return null;
+          }
+
+          // Native support for Shadowsocks
+          if (nodeConfig?.surgeConfig?.shadowsocksFormat === 'ss') {
+            return ([
+              config.nodeName,
+              [
+                'ss',
+                config.hostname,
+                config.port,
+                'encrypt-method=' + config.method,
+                ...pickAndFormatStringList(config, ['password', 'udp-relay', 'obfs', 'obfs-host', 'tfo']),
+                ...(typeof config.mptcp === 'boolean' ? [
+                  `mptcp=${config.mptcp}`,
+                ] : []),
+              ].join(', ')
+            ].join(' = '));
+          }
+
+          // Using external provider
           return ([
             config.nodeName,
             [
@@ -237,7 +335,10 @@ export const getSurgeNodes = (
               config.method,
               config.password,
               'https://raw.githubusercontent.com/ConnersHua/SSEncrypt/master/SSEncrypt.module',
-              ...pickAndFormatStringList(config, ['udp-relay', 'obfs', 'obfs-host']),
+              ...pickAndFormatStringList(config, ['udp-relay', 'obfs', 'obfs-host', 'tfo']),
+              ...(typeof config.mptcp === 'boolean' ? [
+                `mptcp=${config.mptcp}`,
+              ] : []),
             ].join(', ')
           ].join(' = '));
         }
@@ -249,6 +350,33 @@ export const getSurgeNodes = (
             config.nodeName,
             [
               'https',
+              config.hostname,
+              config.port,
+              config.username,
+              config.password,
+              ...(typeof config.tls13 === 'boolean' ? [
+                `tls13=${config.tls13}`,
+              ] : []),
+              ...(typeof config.skipCertVerify === 'boolean' ? [
+                `skip-cert-verify=${config.skipCertVerify}`,
+              ] : []),
+              ...(typeof config.tfo === 'boolean' ? [
+                `tfo=${config.tfo}`,
+              ] : []),
+              ...(typeof config.mptcp === 'boolean' ? [
+                `mptcp=${config.mptcp}`,
+              ] : []),
+            ].join(', ')
+          ].join(' = '));
+        }
+
+        case NodeTypeEnum.HTTP: {
+          const config = nodeConfig as HttpNodeConfig;
+
+          return ([
+            config.nodeName,
+            [
+              'http',
               config.hostname,
               config.port,
               config.username,
@@ -267,13 +395,160 @@ export const getSurgeNodes = (
               config.hostname,
               config.port,
               ...pickAndFormatStringList(config, ['psk', 'obfs']),
-            ].join(', ')
+              ...(typeof config.tfo === 'boolean' ? [
+                `tfo=${config.tfo}`,
+              ] : []),
+              ...(typeof config.mptcp === 'boolean' ? [
+                `mptcp=${config.mptcp}`,
+              ] : []),
+            ].join(', '),
           ].join(' = '));
+        }
+
+        case NodeTypeEnum.Shadowsocksr: {
+          const config = nodeConfig as ShadowsocksrNodeConfig;
+
+          // istanbul ignore next
+          if (!config.binPath) {
+            throw new Error('You must specify a binary file path for Shadowsocksr.');
+          }
+
+          const args = [
+            '-s', config.hostname,
+            '-p', `${config.port}`,
+            '-m', config.method,
+            '-o', config.obfs,
+            '-O', config.protocol,
+            '-k', config.password,
+            '-l', `${config.localPort}`,
+            '-b', '127.0.0.1',
+          ];
+
+          if (config.protoparam) {
+            args.push('-G', config.protoparam);
+          }
+          if (config.obfsparam) {
+            args.push('-g', config.obfsparam);
+          }
+
+          const configString = [
+            'external',
+            `exec = ${JSON.stringify(config.binPath)}`,
+            ...(args.map(arg => `args = ${JSON.stringify(arg)}`)),
+            `local-port = ${config.localPort}`,
+          ];
+
+          if (config.hostnameIp) {
+            configString.push(...config.hostnameIp.map(item => `addresses = ${item}`));
+          }
+
+          configString.push(`addresses = ${config.hostname}`);
+
+          return ([
+            config.nodeName,
+            configString.join(', '),
+          ].join(' = '));
+        }
+
+        case NodeTypeEnum.Vmess: {
+          const config = nodeConfig as VmessNodeConfig;
+
+          if (nodeConfig?.surgeConfig?.v2ray === 'native') {
+            // Native support for vmess
+
+            const configList = [
+              'vmess',
+              config.hostname,
+              config.port,
+              `username=${config.uuid}`,
+            ];
+
+            function getHeader(
+              host: string,
+              ua: string = OBFS_UA
+            ): string {
+              return [
+                `Host:${host}`,
+                `User-Agent:${JSON.stringify(ua)}`,
+              ].join('|');
+            }
+
+            if (config.network === 'ws') {
+              configList.push('ws=true');
+              configList.push(`ws-path=${config.path}`);
+              configList.push(
+                'ws-headers=' +
+                getHeader(config.host || config.hostname)
+              );
+            }
+
+            if (config.tls) {
+              configList.push(
+                  'tls=true',
+                  ...(typeof config.tls13 === 'boolean' ? [
+                    `tls13=${config.tls13}`,
+                  ] : []),
+                  ...(typeof config.skipCertVerify === 'boolean' ? [
+                    `skip-cert-verify=${config.skipCertVerify}`,
+                  ] : []),
+              );
+            }
+
+            if (typeof config.tfo === 'boolean') {
+              configList.push(`tfo=${config.tfo}`);
+            }
+
+            if (typeof config.mptcp === 'boolean') {
+              configList.push(`mptcp=${config.mptcp}`);
+            }
+
+            return ([
+              config.nodeName,
+              configList.join(', '),
+            ].join(' = '));
+          } else {
+            // Using external provider
+
+            // istanbul ignore next
+            if (!config.binPath) {
+              throw new Error('You must specify a binary file path for V2Ray.');
+            }
+
+            const jsonFileName = `v2ray_${config.localPort}_${config.hostname}_${config.port}.json`;
+            const jsonFilePath = path.join(ensureConfigFolder(), jsonFileName);
+            const jsonFile = formatV2rayConfig(config.localPort, nodeConfig);
+            const args = [
+              '--config', jsonFilePath.replace(os.homedir(), '$HOME'),
+            ];
+            const configString = [
+              'external',
+              `exec = ${JSON.stringify(config.binPath)}`,
+              ...(args.map(arg => `args = ${JSON.stringify(arg)}`)),
+              `local-port = ${config.localPort}`,
+            ];
+
+            if (config.hostnameIp) {
+              configString.push(...config.hostnameIp.map(item => `addresses = ${item}`));
+            }
+
+            configString.push(`addresses = ${config.hostname}`);
+
+            // istanbul ignore next
+            if (process.env.NODE_ENV !== 'test') {
+              fs.writeJSONSync(jsonFilePath, jsonFile);
+            }
+
+            return ([
+              config.nodeName,
+              configString.join(', '),
+            ].join(' = '));
+          }
         }
 
         // istanbul ignore next
         default:
-          console.info(`${nodeConfig!.type} is not supported, ${nodeConfig!.nodeName} will be ignored.`);
+          console.log();
+          console.log(chalk.yellow(`不支持为 Surge 生成 ${nodeConfig!.type} 的节点，节点 ${nodeConfig!.nodeName} 会被省略`));
           return null;
       }
     })
@@ -284,10 +559,9 @@ export const getSurgeNodes = (
 
 export const getClashNodes = (
   list: ReadonlyArray<PossibleNodeConfigType>,
-  filter?: NodeFilterType
+  filter?: NodeFilterType|SortedNodeNameFilterType,
 ): ReadonlyArray<any> => {
-  return list
-    .filter(item => filter ? filter(item) : true)
+  return applyFilter(list, filter)
     .map(nodeConfig => {
       if (nodeConfig.enable === false) { return null; }
 
@@ -300,12 +574,25 @@ export const getClashNodes = (
             password: nodeConfig.password,
             port: nodeConfig.port,
             server: nodeConfig.hostname,
-            udp: nodeConfig['udp-relay'] === 'true',
-            ...(nodeConfig.obfs ? {
+            udp: nodeConfig['udp-relay'] || false,
+            ...(['tls', 'http'].includes(nodeConfig.obfs) ? {
               plugin: 'obfs',
               'plugin-opts': {
                 mode: nodeConfig.obfs,
                 host: nodeConfig['obfs-host'],
+              },
+            } : null),
+            ...(['ws', 'wss'].includes(nodeConfig.obfs) ? {
+              plugin: 'v2ray-plugin',
+              'plugin-opts': {
+                mode: 'websocket',
+                tls: nodeConfig.obfs === 'wss',
+                ...(typeof nodeConfig.skipCertVerify === 'boolean' && nodeConfig.obfs === 'wss' ? {
+                  'skip-cert-verify': nodeConfig.skipCertVerify,
+                } : null),
+                host: nodeConfig['obfs-host'],
+                path: nodeConfig['obfs-uri'] || '/',
+                mux: false,
               },
             } : null),
           };
@@ -319,8 +606,13 @@ export const getClashNodes = (
             port: nodeConfig.port,
             uuid: nodeConfig.uuid,
             alterId: nodeConfig.alterId,
-            network: nodeConfig.network,
+            ...(nodeConfig.network === 'tcp' ? null : {
+              network: nodeConfig.network,
+            }),
             tls: nodeConfig.tls,
+            ...(typeof nodeConfig.skipCertVerify === 'boolean' && nodeConfig.tls ? {
+              'skip-cert-verify': nodeConfig.skipCertVerify,
+            } : null),
             ...(nodeConfig.network === 'ws' ? {
               'ws-path': nodeConfig.path,
               'ws-headers': {
@@ -329,20 +621,98 @@ export const getClashNodes = (
             } : null),
           };
 
+        case NodeTypeEnum.Shadowsocksr:
+          return {
+            type: 'ssr',
+            name: nodeConfig.nodeName,
+            server: nodeConfig.hostname,
+            port: nodeConfig.port,
+            password: nodeConfig.password,
+            obfs: nodeConfig.obfs,
+            obfsparam: nodeConfig.obfsparam,
+            protocol: nodeConfig.protocol,
+            protocolparam: nodeConfig.protoparam,
+            cipher: nodeConfig.method,
+          };
+
+        case NodeTypeEnum.Snell:
+          return {
+            type: 'snell',
+            name: nodeConfig.nodeName,
+            server: nodeConfig.hostname,
+            port: nodeConfig.port,
+            psk: nodeConfig.psk,
+            'obfs-opts': {
+              mode: nodeConfig.obfs,
+            },
+          };
+
+        case NodeTypeEnum.HTTPS:
+          return {
+            type: 'http',
+            name: nodeConfig.nodeName,
+            server: nodeConfig.hostname,
+            port: nodeConfig.port,
+            username: nodeConfig.username /* istanbul ignore next */ || '',
+            password: nodeConfig.password /* istanbul ignore next */ || '',
+            tls: true,
+            skipCertVerify: nodeConfig.skipCertVerify === true,
+          };
+
+        case NodeTypeEnum.HTTP:
+          return {
+            type: 'http',
+            name: nodeConfig.nodeName,
+            server: nodeConfig.hostname,
+            port: nodeConfig.port,
+            username: nodeConfig.username /* istanbul ignore next */ || '',
+            password: nodeConfig.password /* istanbul ignore next */ || '',
+          };
+
         // istanbul ignore next
         default:
-          console.info(`${nodeConfig.type} is not supported yet, ${nodeConfig.nodeName} will be ignored.`);
+          console.log();
+          console.log(chalk.yellow(`不支持为 Clash 生成 ${nodeConfig!.type} 的节点，节点 ${nodeConfig!.nodeName} 会被省略`));
           return null;
       }
     })
     .filter(item => item !== null);
 };
 
+export const getMellowNodes = (
+  list: ReadonlyArray<VmessNodeConfig>,
+  filter?: NodeFilterType|SortedNodeNameFilterType
+): string => {
+  const result = applyFilter(list, filter)
+    .map(nodeConfig => {
+      switch (nodeConfig.type) {
+        case NodeTypeEnum.Vmess: {
+          const uri = formatVmessUri(nodeConfig);
+          return [nodeConfig.nodeName, 'vmess1', uri.trim().replace('vmess://', 'vmess1://')].join(', ');
+        }
+
+        // istanbul ignore next
+        default:
+            console.log();
+            console.log(chalk.yellow(`不支持为 Mellow 生成 ${nodeConfig!.type} 的节点，节点 ${nodeConfig!.nodeName} 会被省略`));
+          return null;
+      }
+    })
+    .filter(item => !!item);
+
+  return result.join('\n');
+};
+
 // istanbul ignore next
 export const toUrlSafeBase64 = (str: string): string => URLSafeBase64.encode(Buffer.from(str, 'utf8'));
 
 // istanbul ignore next
-export const fromUrlSafeBase64 = (str: string): string => URLSafeBase64.decode(str).toString('utf8');
+export const fromUrlSafeBase64 = (str: string): string => {
+  if (URLSafeBase64.validate(str)) {
+    return URLSafeBase64.decode(str).toString();
+  }
+  return fromBase64(str);
+};
 
 // istanbul ignore next
 export const toBase64 = (str: string): string => Buffer.from(str, 'utf8').toString('base64');
@@ -393,11 +763,12 @@ export const getShadowsocksNodes = (
 
         // istanbul ignore next
         default:
-          console.info(`${nodeConfig.type} is not supported, ${nodeConfig.nodeName} will be ignored.`);
+          console.log();
+          console.log(chalk.yellow(`在生成 Shadowsocks 节点时出现了 ${nodeConfig.type} 节点，节点 ${nodeConfig.nodeName} 会被省略`));
           return null;
       }
     })
-    .filter(item => item !== null);
+    .filter(item => !!item);
 
   return result.join('\n');
 };
@@ -429,13 +800,16 @@ export const getShadowsocksrNodes = (list: ReadonlyArray<ShadowsocksrNodeConfig>
           return 'ssr://' + toUrlSafeBase64([
             baseUri,
             '/?',
-            queryString.stringify(query),
+            queryString.stringify(query, {
+              encode: false,
+            }),
           ].join(''));
         }
 
         // istanbul ignore next
         default:
-          console.info(`${nodeConfig.type} is not supported, ${nodeConfig.nodeName} will be ignored.`);
+          console.log();
+          console.log(chalk.yellow(`在生成 Shadowsocksr 节点时出现了 ${nodeConfig.type} 节点，节点 ${nodeConfig.nodeName} 会被省略`));
           return null;
       }
     })
@@ -470,7 +844,8 @@ export const getV2rayNNodes = (list: ReadonlyArray<VmessNodeConfig>): string => 
 
         // istanbul ignore next
         default:
-          console.info(`${nodeConfig.type} is not supported, ${nodeConfig.nodeName} will be ignored.`);
+          console.log();
+          console.log(chalk.yellow(`在生成 V2Ray 节点时出现了 ${nodeConfig.type} 节点，节点 ${nodeConfig.nodeName} 会被省略`));
           return null;
       }
     })
@@ -481,11 +856,12 @@ export const getV2rayNNodes = (list: ReadonlyArray<VmessNodeConfig>): string => 
 
 export const getQuantumultNodes = (
   list: ReadonlyArray<ShadowsocksNodeConfig|VmessNodeConfig|ShadowsocksrNodeConfig|HttpsNodeConfig>,
-  groupName: string = 'Surgio'
+  groupName: string = 'Surgio',
+  filter?: NodeNameFilterType|SortedNodeNameFilterType,
 ): string => {
   function getHeader(
-    host,
-    ua = 'Mozilla/5.0 (iPhone; CPU iPhone OS 12_3_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148'
+    host: string,
+    ua = OBFS_UA
   ): string {
     return [
       `Host:${host}`,
@@ -493,10 +869,8 @@ export const getQuantumultNodes = (
     ].join('[Rr][Nn]');
   }
 
-  const result: ReadonlyArray<string> = list
+  const result: ReadonlyArray<string> = applyFilter(list, filter)
     .map<string>(nodeConfig => {
-      if (nodeConfig.enable === false) { return null; }
-
       switch (nodeConfig.type) {
         case NodeTypeEnum.Vmess: {
           const config = [
@@ -544,7 +918,8 @@ export const getQuantumultNodes = (
 
         // istanbul ignore next
         default:
-          console.info(`${nodeConfig!.type} is not supported yet, ${nodeConfig!.nodeName} will be ignored.`);
+          console.log();
+          console.log(chalk.yellow(`不支持为 Quantumult 生成 ${nodeConfig!.type} 的节点，节点 ${nodeConfig!.nodeName} 会被省略`));
           return null;
       }
     })
@@ -553,6 +928,138 @@ export const getQuantumultNodes = (
   return result.join('\n');
 };
 
+/**
+ * @see https://github.com/crossutility/Quantumult-X/blob/master/sample.conf
+ */
+export const getQuantumultXNodes = (
+  list: ReadonlyArray<ShadowsocksNodeConfig|VmessNodeConfig|ShadowsocksrNodeConfig|HttpsNodeConfig|HttpNodeConfig>,
+  filter?: NodeNameFilterType|SortedNodeNameFilterType,
+): string => {
+  const result: ReadonlyArray<string> = applyFilter(list, filter)
+    .map<string>(nodeConfig => {
+      switch (nodeConfig.type) {
+        case NodeTypeEnum.Vmess: {
+          const config = [
+            `${nodeConfig.hostname}:${nodeConfig.port}`,
+            // method 为 auto 时 qx 会无法识别
+            (nodeConfig.method === 'auto' ?
+              `method=chacha20-ietf-poly1305` :
+              `method=${nodeConfig.method}`),
+            `password=${nodeConfig.uuid}`,
+            'udp-relay=true',
+            ...(nodeConfig.tfo ? [
+              `fast-open=${nodeConfig.tfo}`,
+            ] : []),
+          ];
+
+          switch (nodeConfig.network) {
+            case 'ws':
+              if (nodeConfig.tls) {
+                config.push(`obfs=wss`);
+              } else {
+                config.push(`obfs=ws`);
+              }
+              config.push(`obfs-uri=${nodeConfig.path || '/'}`);
+              config.push(`obfs-host=${nodeConfig.host || nodeConfig.hostname}`);
+
+              break;
+            case 'tcp':
+              if (nodeConfig.tls) {
+                config.push(`obfs=over-tls`);
+              }
+
+              break;
+            default:
+              // do nothing
+          }
+
+          config.push(`tag=${nodeConfig.nodeName}`);
+
+          return `vmess=${config.join(', ')}`;
+        }
+
+        case NodeTypeEnum.Shadowsocks: {
+          const config = [
+            `${nodeConfig.hostname}:${nodeConfig.port}`,
+            ...pickAndFormatStringList(nodeConfig, ['method', 'password']),
+            ...(['http', 'tls'].includes(nodeConfig.obfs) ? [
+              `obfs=${nodeConfig.obfs}`,
+              `obfs-host=${nodeConfig['obfs-host']}`,
+            ] : []),
+            ...(['ws', 'wss'].includes(nodeConfig.obfs) ? [
+              `obfs=${nodeConfig.obfs}`,
+              `obfs-host=${nodeConfig['obfs-host'] || nodeConfig.hostname}`,
+              `obfs-uri=${nodeConfig['obfs-uri'] || '/'}`,
+            ] : []),
+            ...(nodeConfig['udp-relay'] ? [
+              `udp-relay=${nodeConfig['udp-relay']}`,
+            ] : []),
+            ...(nodeConfig.tfo ? [
+              `fast-open=${nodeConfig.tfo}`,
+            ] : []),
+            `tag=${nodeConfig.nodeName}`,
+          ]
+            .join(', ');
+
+          return `shadowsocks=${config}`;
+        }
+
+        case NodeTypeEnum.Shadowsocksr: {
+          const config = [
+            `${nodeConfig.hostname}:${nodeConfig.port}`,
+            ...pickAndFormatStringList(nodeConfig, ['method', 'password']),
+            `ssr-protocol=${nodeConfig.protocol}`,
+            `ssr-protocol-param=${nodeConfig.protoparam}`,
+            `obfs=${nodeConfig.obfs}`,
+            `obfs-host=${nodeConfig.obfsparam}`,
+            ...(nodeConfig['udp-relay'] ? [
+              `udp-relay=${nodeConfig['udp-relay']}`,
+            ] : []),
+            ...(nodeConfig.tfo ? [
+              `fast-open=${nodeConfig.tfo}`,
+            ] : []),
+            `tag=${nodeConfig.nodeName}`,
+          ]
+            .join(', ');
+
+          return `shadowsocks=${config}`;
+        }
+
+        case NodeTypeEnum.HTTP:
+        case NodeTypeEnum.HTTPS: {
+          const config = [
+            `${nodeConfig.hostname}:${nodeConfig.port}`,
+            ...pickAndFormatStringList(nodeConfig, ['username', 'password']),
+            ...(nodeConfig.tfo ? [
+              `fast-open=${nodeConfig.tfo}`,
+            ] : []),
+          ];
+
+          if (nodeConfig.type === NodeTypeEnum.HTTPS) {
+            config.push(
+              'over-tls=true',
+              `tls-verification=${nodeConfig.skipCertVerify !== true}`
+            );
+          }
+
+          config.push(`tag=${nodeConfig.nodeName}`);
+
+          return `http=${config.join(', ')}`;
+        }
+
+        // istanbul ignore next
+        default:
+          console.log();
+          console.log(chalk.yellow(`不支持为 QuantumultX 生成 ${nodeConfig!.type} 的节点，节点 ${nodeConfig!.nodeName} 会被省略`));
+          return null;
+      }
+    })
+    .filter(item => !!item);
+
+  return result.join('\n');
+};
+
+// istanbul ignore next
 export const getShadowsocksNodesJSON = (list: ReadonlyArray<ShadowsocksNodeConfig>): string => {
   const nodes: ReadonlyArray<object> = list
     .map(nodeConfig => {
@@ -580,7 +1087,8 @@ export const getShadowsocksNodesJSON = (list: ReadonlyArray<ShadowsocksNodeConfi
 
         // istanbul ignore next
         default:
-          console.info(`${nodeConfig!.type} is not supported, ${nodeConfig!.nodeName} will be ignored.`);
+          console.log();
+          console.log(chalk.yellow(`在生成 Shadowsocks 节点时出现了 ${nodeConfig.type} 节点，节点 ${nodeConfig.nodeName} 会被省略`));
           return null;
       }
     })
@@ -591,28 +1099,41 @@ export const getShadowsocksNodesJSON = (list: ReadonlyArray<ShadowsocksNodeConfi
 
 export const getNodeNames = (
   list: ReadonlyArray<SimpleNodeConfig>,
-  nodeTypeList: readonly NodeTypeEnum[] = [NodeTypeEnum.Shadowsocks, NodeTypeEnum.HTTPS, NodeTypeEnum.Snell],
-  filter?: NodeNameFilterType
+  filter?: NodeNameFilterType|SortedNodeNameFilterType,
+  separator?: string,
 ): string => {
-  const nodes = list.filter(item => {
-    const result = nodeTypeList.includes(item.type) && item.enable !== false;
-
-    if (filter) {
-      return filter(item) && result;
-    }
-
-    return result;
-  });
-
-  return nodes.map(item => item.nodeName).join(', ');
+  return applyFilter(list, filter).map(item => item.nodeName).join(separator || ', ');
 };
 
 export const getClashNodeNames = (
+  list: ReadonlyArray<SimpleNodeConfig>,
+  filter?: NodeNameFilterType|SortedNodeNameFilterType,
+  existingProxies?: ReadonlyArray<string>,
+): ReadonlyArray<string> => {
+  let result: string[] = [];
+
+  if (existingProxies) {
+    result = result.concat(existingProxies);
+  }
+
+  result = result.concat(applyFilter(list, filter).map(item => item.nodeName));
+
+  return result;
+};
+
+export const generateClashProxyGroup = (
   ruleName: string,
-  ruleType: 'select' | 'url-test',
+  ruleType: 'select'|'url-test'|'fallback'|'load-balance',
   nodeNameList: ReadonlyArray<SimpleNodeConfig>,
-  nodeTypeList: ReadonlyArray<NodeTypeEnum> = [NodeTypeEnum.Shadowsocks],
-  filter?: NodeNameFilterType
+  options: {
+    readonly filter?: NodeNameFilterType|SortedNodeNameFilterType,
+    readonly existingProxies?: ReadonlyArray<string>,
+    readonly proxyTestUrl?: string,
+    readonly proxyTestInterval?: number,
+  } = {
+    proxyTestUrl: PROXY_TEST_URL,
+    proxyTestInterval: PROXY_TEST_INTERVAL,
+  },
 ): {
   readonly type: string;
   readonly name: string;
@@ -620,51 +1141,32 @@ export const getClashNodeNames = (
   readonly url?: string;
   readonly interval?: number;
 } => {
-  const nodes = nodeNameList.filter(item => {
-    const result = nodeTypeList.includes(item.type) && item.enable !== false;
+  let proxies;
 
-    if (filter) {
-      return filter(item) && result;
+  if (options.existingProxies) {
+    if (options.filter) {
+      const nodes = applyFilter(nodeNameList, options.filter);
+      proxies = [].concat(options.existingProxies, nodes.map(item => item.nodeName));
+    } else {
+      proxies = options.existingProxies;
     }
-
-    return result;
-  });
+  } else {
+    const nodes = applyFilter(nodeNameList, options.filter);
+    proxies = nodes.map(item => item.nodeName);
+  }
 
   return {
     type: ruleType,
     name: ruleName,
-    proxies: nodes.map(item => item.nodeName),
-    ...(ruleType === 'url-test' ? {
-      url: 'http://www.gstatic.com/generate_204',
-      interval: 1200,
+    proxies,
+    ...(['url-test', 'fallback', 'load-balance'].includes(ruleType) ? {
+      url: options.proxyTestUrl,
+      interval: options.proxyTestInterval,
     } : null),
   };
 };
 
 export const toYaml = (obj: JsonObject): string => YAML.stringify(obj);
-
-export const netflixFilter: NodeNameFilterType = item => {
-  const name = item.nodeName.toLowerCase();
-  return [
-    'netflix',
-    'hkbn',
-    'hkt',
-    'hgc',
-  ].some(key => name.toLowerCase().includes(key.toLowerCase()));
-};
-
-export const youtubePremiumFilter: NodeNameFilterType = item => {
-  const name = item.nodeName.toLowerCase();
-  return ['日', '美', '韩', '🇯🇵', '🇺🇸', '🇰🇷'].some(key => name.toLowerCase().includes(key.toLowerCase()));
-};
-
-export const usFilter: NodeNameFilterType = item => {
-  return ['🇺🇸', '美'].some(key => item.nodeName.includes(key));
-};
-
-export const hkFilter: NodeNameFilterType = item => {
-  return ['🇭🇰', '港'].some(key => item.nodeName.includes(key));
-};
 
 export const pickAndFormatStringList = (obj: object, keyList: readonly string[]): readonly string[] => {
   const result: string[] = [];
@@ -676,7 +1178,7 @@ export const pickAndFormatStringList = (obj: object, keyList: readonly string[])
   return result;
 };
 
-export const decodeStringList = <T = object>(stringList: ReadonlyArray<string>): T => {
+export const decodeStringList = <T = Record<string, string|boolean>>(stringList: ReadonlyArray<string>): T => {
   const result = {};
   stringList.forEach(item => {
     const pair = item.split('=');
@@ -685,118 +1187,147 @@ export const decodeStringList = <T = object>(stringList: ReadonlyArray<string>):
   return result as T;
 };
 
-export const normalizeConfig = (cwd: string, obj: Partial<CommandConfig>): CommandConfig => {
-  const config: CommandConfig = _.defaultsDeep(obj, {
-    artifacts: [],
-    urlBase: '/',
-    output: path.resolve(cwd, './dist'),
-    templateDir: path.resolve(cwd, './template'),
-    providerDir: path.resolve(cwd, './provider'),
-    upload: {
-      region: 'oss-cn-hangzhou',
-      prefix: '/',
-    },
-  });
+export const normalizeClashProxyGroupConfig = (
+  nodeList: ReadonlyArray<PossibleNodeConfigType>,
+  customFilters: PlainObjectOf<NodeNameFilterType|SortedNodeNameFilterType>,
+  proxyGroupModifier: ProxyGroupModifier,
+  options: {
+    readonly proxyTestUrl?: string,
+    readonly proxyTestInterval?: number,
+  } = {},
+): ReadonlyArray<any> => {
+  const proxyGroup = proxyGroupModifier(nodeList, customFilters);
 
-  if (!fs.existsSync(config.templateDir)) {
-    throw new Error(`You must create ${config.templateDir} first.`);
+  return proxyGroup.map<any>(item => {
+    if (item.hasOwnProperty('filter')) {
+      // istanbul ignore next
+      if (!item.filter || !validateFilter(item.filter)) {
+        throw new Error(`过滤器 ${item.filter} 无效，请检查 proxyGroupModifier`);
+      }
+
+      return generateClashProxyGroup(item.name, item.type, nodeList, {
+        filter: item.filter,
+        existingProxies: item.proxies,
+        proxyTestUrl: options.proxyTestUrl,
+        proxyTestInterval: options.proxyTestInterval,
+      });
+    } else {
+      return generateClashProxyGroup(item.name, item.type, nodeList, {
+        existingProxies: item.proxies,
+        proxyTestUrl: options.proxyTestUrl,
+        proxyTestInterval: options.proxyTestInterval,
+      });
+    }
+  });
+};
+
+export const ensureConfigFolder = (dir: string = os.homedir()): string => {
+  let baseDir;
+
+  try {
+    fs.accessSync(dir, fs.constants.W_OK);
+    baseDir = dir;
+  } catch (err) {
+    // can't write
+    baseDir = '/tmp';
   }
-  if (!fs.existsSync(config.providerDir)) {
-    throw new Error(`You must create ${config.providerDir} first.`);
+
+  const configDir = path.join(baseDir, '.config/surgio');
+  fs.mkdirpSync(configDir);
+  return configDir;
+};
+
+export const formatV2rayConfig = (localPort: string|number, nodeConfig: VmessNodeConfig): JsonObject => {
+  const config: any = {
+    log: {
+      loglevel: 'warning'
+    },
+    inbound: {
+      port: localPort,
+      listen: '127.0.0.1',
+      protocol: 'socks',
+      settings: {
+        auth: 'noauth',
+      }
+    },
+    outbound: {
+      protocol: 'vmess',
+      settings: {
+        vnext: [
+          {
+            address: nodeConfig.hostname,
+            port: nodeConfig.port,
+            users: [
+              {
+                id: nodeConfig.uuid,
+                alterId: Number(nodeConfig.alterId),
+                security: nodeConfig.method,
+                level: 0,
+              }
+            ]
+          }
+        ]
+      },
+      streamSettings: {
+        security: 'none',
+      },
+    }
+  };
+
+  if (nodeConfig.tls) {
+    config.outbound.streamSettings = {
+      ...config.outbound.streamSettings,
+      security: 'tls',
+      tlsSettings: {
+        serverName: nodeConfig.host || nodeConfig.hostname,
+        ...(typeof nodeConfig.skipCertVerify === 'boolean' ? {
+          allowInsecure: nodeConfig.skipCertVerify,
+        } : null),
+        ...(typeof nodeConfig.tls13 === 'boolean' ? {
+          allowInsecureCiphers: !nodeConfig.tls13,
+        } : null),
+      },
+    };
+  }
+
+  if (nodeConfig.network === 'ws') {
+    config.outbound.streamSettings = {
+      ...config.outbound.streamSettings,
+      network: nodeConfig.network,
+      wsSettings: {
+        path: nodeConfig.path,
+        headers: {
+          Host: nodeConfig.host,
+          'User-Agent': OBFS_UA,
+        },
+      },
+    };
   }
 
   return config;
 };
 
-export const loadConfig = (cwd: string, configPath: string, override?: Partial<CommandConfig>): CommandConfig => {
-  const absPath = path.resolve(cwd, configPath);
-
-  if (!fs.existsSync(absPath)) {
-    throw new Error(`${absPath} cannot be found.`);
+export const applyFilter = <T extends SimpleNodeConfig>(
+  nodeList: ReadonlyArray<T>,
+  filter?: NodeNameFilterType|SortedNodeNameFilterType
+): ReadonlyArray<T> => {
+  if (filter && !validateFilter(filter)) {
+    throw new Error(`使用了无效的过滤器 ${filter}`);
   }
 
-  if (override) {
-    return {
-      ...normalizeConfig(cwd, require(absPath)),
-      ...override,
-    };
-  }
+  let nodes: ReadonlyArray<T> = nodeList.filter(item => {
+    const result = item.enable !== false;
 
-  return normalizeConfig(cwd, require(absPath));
-};
-
-export const normalizeClashProxyGroupConfig = (
-  nodeList: ReadonlyArray<PossibleNodeConfigType>,
-  customFilters: PlainObjectOf<NodeNameFilterType>,
-  proxyGroupModifier: ProxyGroupModifier
-): ReadonlyArray<any> => {
-  const proxyGroup = proxyGroupModifier(nodeList, customFilters);
-
-  return proxyGroup.map<any>(item => {
-    if (item.filter) {
-      return getClashNodeNames(item.name, item.type, nodeList, [
-        NodeTypeEnum.Shadowsocks,
-        NodeTypeEnum.Vmess,
-      ], item.filter);
-    } else if (item.proxies) {
-      return item;
-    } else {
-      return getClashNodeNames(item.name, item.type, nodeList, [
-        NodeTypeEnum.Shadowsocks,
-        NodeTypeEnum.Vmess,
-      ]);
+    if (filter && typeof filter === 'function') {
+      return filter(item) && result;
     }
+
+    return result;
   });
-};
 
-export const addProxyToSurgeRuleSet = (str: string, rule: string): string => {
-  const result: string[] = [];
-
-  str
-    .split('\n')
-    .filter(item => item && item.trim() !== '')
-    .forEach(item => {
-      if (!item.startsWith('#') && !item.startsWith('//')) {
-        const comment = item.split('//');
-        const line = comment[0].trim().split(',');
-
-        if (line.length === 2) {
-          line.push(rule);
-        } else {
-          line.splice(2, 0, rule);
-        }
-
-        result.push(line.join(',') + (comment[1] ? ` //${comment[1]}` : ''));
-      } else {
-        result.push(item);
-      }
-    });
-
-  return result.join('\n');
-};
-
-export const loadRemoteSnippetList = (remoteSnippetList: ReadonlyArray<RemoteSnippetConfig>): Promise<ReadonlyArray<RemoteSnippet>> => {
-  function load(url: string): Promise<string> {
-    console.log(`下载远程片段：${url}`);
-
-    return axios.get<string>(url, {
-      timeout: 20000,
-      proxy: false,
-      responseType: 'text',
-    })
-      .then(data => data.data)
-      .catch(err => {
-        console.error(`远程片段 ${url} 下载失败。`);
-        throw err;
-      });
+  if (filter && typeof filter === 'object' && typeof filter.filter === 'function') {
+    nodes = filter.filter(nodes);
   }
 
-  return Promise.all(remoteSnippetList.map<Promise<RemoteSnippet>>(item => {
-    return load(item.url)
-      .then(res => ({
-        main: (rule: string) => addProxyToSurgeRuleSet(res, rule),
-        name: item.name,
-        url: item.url,
-      }));
-  }));
+  return nodes;
 };

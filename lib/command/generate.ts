@@ -1,20 +1,21 @@
 import Command from 'common-bin';
 import path from 'path';
 
-import { loadConfig } from '../utils';
+import { loadConfig } from '../utils/config';
 import generate from '../generate';
+import { errorHandler } from '../utils/error-helper';
 
 class GenerateCommand extends Command {
   private options: object;
 
   constructor(rawArgv) {
     super(rawArgv);
-    this.usage = 'Usage: surgio generate';
+    this.usage = '使用方法: surgio generate';
     this.options = {
       output: {
         type: 'string',
         alias: 'o',
-        description: 'folder for saving files',
+        description: '生成规则的目录',
       },
       config: {
         alias: 'c',
@@ -33,7 +34,12 @@ class GenerateCommand extends Command {
   }
 
   public get description(): string {
-    return 'Generate configurations';
+    return '生成规则';
+  }
+
+  // istanbul ignore next
+  public errorHandler(err): void {
+    errorHandler.call(this, err);
   }
 }
 

@@ -1,12 +1,13 @@
+// istanbul ignore file
 import OSS from 'ali-oss';
-import assert from 'assert';
 import Command from 'common-bin';
 import fs from 'fs';
 import dir from 'node-dir';
 import ora, { Ora } from 'ora';
-import path from "path";
+import path from 'path';
 
-import { loadConfig } from '../utils';
+import { loadConfig } from '../utils/config';
+import { errorHandler } from '../utils/error-helper';
 
 class GenerateCommand extends Command {
   private readonly spinner: Ora;
@@ -14,13 +15,13 @@ class GenerateCommand extends Command {
 
   constructor(rawArgv) {
     super(rawArgv);
-    this.usage = 'Usage: surgio upload';
+    this.usage = '使用方法: surgio upload';
     this.spinner = ora();
     this.options = {
       output: {
         type: 'string',
         alias: 'o',
-        description: 'folder for saving files',
+        description: '生成规则的目录',
       },
       config: {
         alias: 'c',
@@ -37,24 +38,19 @@ class GenerateCommand extends Command {
     });
 
     const ossConfig = {
-      region: config.upload.region,
+      region: config.upload.region || 'oss-cn-hangzhou',
       bucket: config.upload.bucket,
       accessKeyId: ctx.env.OSS_ACCESS_KEY_ID || config.upload.accessKeyId,
       accessKeySecret: ctx.env.OSS_ACCESS_KEY_SECRET || config.upload.accessKeySecret,
     };
-
-    assert(ossConfig.bucket);
-    assert(ossConfig.accessKeyId);
-    assert(ossConfig.accessKeySecret);
-
     const client = new OSS({
       secure: true,
       ...ossConfig,
     });
-    const { prefix } = config.upload;
+    const prefix = config.upload.prefix || '/';
     const fileList = await dir.promiseFiles(config.output);
     const files = fileList.map(filePath => ({
-      fileName: filePath.split('/').slice(-1)[0],
+      fileName: path.basename(filePath),
       filePath,
     }));
     const fileNameList = files.map(file => file.fileName);
@@ -97,20 +93,20 @@ class GenerateCommand extends Command {
       }
     };
 
-    this.spinner.start('Start uploading to Aliyun OSS');
+    this.spinner.start('开始上传到阿里云 OSS');
     await upload();
     await deleteUnwanted();
     this.spinner.succeed();
   }
 
   public get description(): string {
-    return 'Upload configurations to Aliyun OSS';
+    return '上传规则到阿里云 OSS';
   }
 
   public errorHandler(err): void {
     this.spinner.fail();
 
-    super.errorHandler(err);
+    errorHandler.call(this, err);
   }
 }
 

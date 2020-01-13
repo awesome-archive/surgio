@@ -1,216 +1,341 @@
 'use strict';
 
 import assert from 'assert';
+import Bluebird from 'bluebird';
 import chalk from 'chalk';
+import fs from 'fs-extra';
 import _ from 'lodash';
-import { fs } from 'mz';
+import { Environment } from 'nunjucks';
 import ora from 'ora';
 import path from 'path';
-import _rimraf from 'rimraf';
-import util from 'util';
-import getEngine from './template';
 
+import getEngine from './template';
 import {
   ArtifactConfig,
-  BlackSSLProviderConfig,
   CommandConfig,
-  CustomProviderConfig,
-  NodeFilterType,
-  NodeNameFilterType,
+  NodeTypeEnum,
   PossibleNodeConfigType,
   ProviderConfig,
   RemoteSnippet,
-  ShadowsocksJsonSubscribeProviderConfig,
   SimpleNodeConfig,
-  SupportProviderEnum, 
-  V2rayNSubscribeProviderConfig, 
-  ShadowsocksSubscribeProviderConfig,
 } from './types';
 import {
-  getBlackSSLConfig,
-  getClashNodeNames,
   getClashNodes,
   getDownloadUrl,
   getNodeNames,
   getQuantumultNodes,
-  getShadowsocksJSONConfig,
+  getV2rayNNodes,
+  getQuantumultXNodes,
   getShadowsocksNodes,
   getShadowsocksNodesJSON,
   getShadowsocksrNodes,
-  getSurgeNodes, getV2rayNSubscription,
-  hkFilter,
-  loadRemoteSnippetList,
-  netflixFilter as defaultNetflixFilter,
+  getSurgeNodes,
+  getMellowNodes,
   normalizeClashProxyGroupConfig,
-  resolveRoot,
   toBase64,
   toUrlSafeBase64,
-  usFilter,
-  youtubePremiumFilter as defaultYoutubePremiumFilter,
-  getShadowsocksSubscription,
+  getClashNodeNames,
 } from './utils';
+import { loadRemoteSnippetList } from './utils/remote-snippet';
+import { isIp, resolveDomain } from './utils/dns';
+import {
+  hkFilter, japanFilter, koreaFilter,
+  netflixFilter as defaultNetflixFilter,
+  singaporeFilter,
+  taiwanFilter,
+  usFilter,
+  validateFilter,
+  youtubePremiumFilter as defaultYoutubePremiumFilter,
+} from './utils/filter';
+import getProvider from './utils/get-provider';
+import { prependFlag } from './utils/flag';
+import { NETWORK_CONCURRENCY } from './utils/constant';
+import Provider from './provider/Provider';
 
-const rimraf = util.promisify(_rimraf);
 const spinner = ora();
 
 async function run(config: CommandConfig): Promise<void> {
   const artifactList: ReadonlyArray<ArtifactConfig> = config.artifacts;
-  const distPath = resolveRoot(config.output);
+  const distPath = config.output;
   const remoteSnippetsConfig = config.remoteSnippets || [];
   const remoteSnippetList = await loadRemoteSnippetList(remoteSnippetsConfig);
+  const templateEngine = getEngine(config.templateDir, config.publicUrl);
 
-  await rimraf(distPath);
+  await fs.remove(distPath);
   await fs.mkdir(distPath);
 
   for (const artifact of artifactList) {
-    spinner.start(`Generating ${artifact.name}`);
+    spinner.start(`正在生成规则 ${artifact.name}`);
 
-    const result = await generate(config, artifact, remoteSnippetList);
-    const destFilePath = resolveRoot(config.output, artifact.name);
+    try {
+      const result = await generate(config, artifact, remoteSnippetList, templateEngine);
+      const destFilePath = path.join(config.output, artifact.name);
 
-    await fs.writeFile(destFilePath, result);
-    spinner.succeed();
+      if (artifact.destDir) {
+        fs.accessSync(artifact.destDir, fs.constants.W_OK);
+        await fs.writeFile(path.join(artifact.destDir, artifact.name), result);
+      } else {
+        await fs.writeFile(destFilePath, result);
+      }
+
+      spinner.succeed(`规则 ${artifact.name} 生成成功`);
+    } catch (err) {
+      spinner.fail(`规则 ${artifact.name} 生成失败`);
+      throw err;
+    }
   }
 }
 
 export async function generate(
   config: CommandConfig,
   artifact: ArtifactConfig,
-  remoteSnippetList: ReadonlyArray<RemoteSnippet>
+  remoteSnippetList: ReadonlyArray<RemoteSnippet>,
+  templateEngine: Environment,
 ): Promise<string> {
-  const templateEngine = getEngine(config.templateDir);
   const {
     name: artifactName,
     template,
-    provider,
     customParams,
+    templateString,
   } = artifact;
 
-  assert(artifactName, 'You must specify the artifact\'s name.');
-  assert(template, 'You must specify the artifact\'s template.');
-  assert(provider, 'You must specify the artifact\'s provider.');
+  assert(artifactName, '必须指定 artifact 的 name 属性');
+  assert(artifact.provider, '必须指定 artifact 的 provider 属性');
+  if (!templateString) {
+    assert(template, '必须指定 artifact 的 template 属性');
+  }
 
-  const tplBuffer = await fs.readFile(path.resolve(config.templateDir, `${template}.tpl`));
-  const recipeList = artifact.recipe ? artifact.recipe : [artifact.provider];
+  const gatewayConfig = config.gateway;
+  const gatewayHasToken: boolean = !!(gatewayConfig && gatewayConfig.accessToken);
+  const mainProviderName = artifact.provider;
+  const combineProviders = artifact.combineProviders || [];
+  const providerList = [mainProviderName].concat(combineProviders);
+  const nodeConfigListMap: Map<string, ReadonlyArray<PossibleNodeConfigType>> = new Map();
   const nodeList: PossibleNodeConfigType[] = [];
   const nodeNameList: SimpleNodeConfig[] = [];
-  const customFilters: {
-    nodeFilter?: NodeFilterType;
-    netflixFilter?: NodeNameFilterType;
-    youtubePremiumFilter?: NodeNameFilterType;
-  } = {};
+  let customFilters: ProviderConfig['customFilters'];
+  let netflixFilter: ProviderConfig['netflixFilter'];
+  let youtubePremiumFilter: ProviderConfig['youtubePremiumFilter'];
+  let progress = 0;
 
-  const recipeConfigList = await Promise.all(
-    recipeList.map<Promise<ReadonlyArray<PossibleNodeConfigType>>>(providerName => {
-      const filePath = path.resolve(config.providerDir, `${providerName}.js`);
+  if (config.binPath && config.binPath.v2ray) {
+    config.binPath.vmess = config.binPath.v2ray;
+  }
 
-      if (!fs.existsSync(filePath)) {
-        throw new Error(`${filePath} cannot be found.`);
+  const providerMapper = async (providerName: string): Promise<void> => {
+    const filePath = path.resolve(config.providerDir, `${providerName}.js`);
+
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`文件 ${filePath} 不存在`);
+    }
+
+    let provider: Provider;
+    let nodeConfigList: ReadonlyArray<PossibleNodeConfigType>;
+
+    try {
+      provider = getProvider(providerName, require(filePath));
+    } catch (err) {
+      err.message = `处理 ${chalk.cyan(providerName)} 时出现错误，相关文件 ${filePath} ，错误原因: ${err.message}`;
+      throw err;
+    }
+
+    try {
+      nodeConfigList = await provider.getNodeList();
+    } catch (err) {
+      err.message = `获取 ${chalk.cyan(providerName)} 节点时出现错误，相关文件 ${filePath} ，错误原因: ${err.message}`;
+      throw err;
+    }
+
+    // Filter 仅使用第一个 Provider 中的定义
+    if (providerName === mainProviderName) {
+      if (!netflixFilter) {
+        netflixFilter = provider.netflixFilter || defaultNetflixFilter;
       }
-
-      const file: ProviderConfig = require(filePath);
-
-      customFilters.nodeFilter = file.nodeFilter;
-      customFilters.netflixFilter = file.netflixFilter || defaultNetflixFilter;
-      customFilters.youtubePremiumFilter = file.youtubePremiumFilter || defaultYoutubePremiumFilter;
-
-      assert(file.type, 'You must specify a type.');
-
-      switch (file.type) {
-        case SupportProviderEnum.BlackSSL:
-          return getBlackSSLConfig(file as BlackSSLProviderConfig);
-
-        case SupportProviderEnum.ShadowsocksJsonSubscribe:
-          return getShadowsocksJSONConfig(file as ShadowsocksJsonSubscribeProviderConfig);
-
-        case SupportProviderEnum.ShadowsocksSubscribe:
-          return getShadowsocksSubscription(file as ShadowsocksSubscribeProviderConfig);
-
-        case SupportProviderEnum.Custom: {
-          assert((file as CustomProviderConfig).nodeList, 'Lack of nodeList.');
-          return Promise.resolve((file as CustomProviderConfig).nodeList);
-        }
-
-        case SupportProviderEnum.V2rayNSubscribe:
-          return getV2rayNSubscription(file as V2rayNSubscribeProviderConfig);
-
-        default:
-          throw new Error(`Unsupported provider type: ${file.type}`);
+      if (!youtubePremiumFilter) {
+        youtubePremiumFilter = provider.youtubePremiumFilter || defaultYoutubePremiumFilter;
       }
-    })
-  );
+      if (!customFilters) {
+        customFilters = {
+          ...config.customFilters,
+          ...provider.customFilters,
+        };
+      }
+    }
 
-  recipeConfigList.forEach(recipeConfig => {
-    return recipeConfig.forEach(nodeConfig => {
+    if (
+      validateFilter(provider.nodeFilter) &&
+      typeof provider.nodeFilter === 'object' &&
+      provider.nodeFilter.supportSort
+    ) {
+      nodeConfigList = provider.nodeFilter.filter(nodeConfigList);
+    }
+
+    nodeConfigList = await Bluebird.map(nodeConfigList, async nodeConfig => {
       let isValid = false;
 
-      if (!customFilters.nodeFilter) {
+      if (nodeConfig.enable === false) {
+        return null;
+      }
+
+      if (!provider.nodeFilter) {
         isValid = true;
-      } else if (customFilters.nodeFilter(nodeConfig)) {
-        isValid = true;
+      } else if (validateFilter(provider.nodeFilter)) {
+        isValid = typeof provider.nodeFilter === 'function' ?
+          provider.nodeFilter(nodeConfig) :
+          true;
       }
 
       if (isValid) {
+        if (config.binPath && config.binPath[nodeConfig.type]) {
+          nodeConfig.binPath = config.binPath[nodeConfig.type];
+          nodeConfig.localPort = provider.nextPort;
+        }
+
+        nodeConfig.provider = provider;
+        nodeConfig.surgeConfig = config.surgeConfig;
+
+        if (provider.renameNode) {
+          const newName = provider.renameNode(nodeConfig.nodeName);
+
+          if (newName) {
+            nodeConfig.nodeName = newName;
+          }
+        }
+
+        // 给节点名加国旗
+        if (provider.addFlag) {
+          nodeConfig.nodeName = prependFlag(nodeConfig.nodeName);
+        }
+
+        // TCP Fast Open
+        if (provider.tfo) {
+          nodeConfig.tfo = provider.tfo;
+        }
+
+        // MPTCP
+        if (provider.mptcp) {
+          nodeConfig.mptcp = provider.mptcp;
+        }
+
+        if (
+          config.surgeConfig.resolveHostname &&
+          !isIp(nodeConfig.hostname) &&
+          [NodeTypeEnum.Vmess, NodeTypeEnum.Shadowsocksr].includes(nodeConfig.type)
+        ) {
+          try {
+            nodeConfig.hostnameIp = await resolveDomain(nodeConfig.hostname);
+          } /* istanbul ignore next */ catch (err) {
+            console.log();
+            console.warn(`${nodeConfig.hostname} 无法解析，将忽略该域名的解析结果`);
+          }
+        }
+
+        return nodeConfig;
+      }
+
+      return null;
+    })
+      .filter(item => !!item);
+
+
+    nodeConfigListMap.set(providerName, nodeConfigList);
+
+    spinner.text = `已处理 Provider ${++progress}/${providerList.length}...`;
+  };
+
+  await Bluebird.map(providerList, providerMapper, { concurrency: NETWORK_CONCURRENCY });
+
+  providerList.forEach(providerName => {
+    const nodeConfigList = nodeConfigListMap.get(providerName);
+
+    nodeConfigList.forEach(nodeConfig => {
+      if (nodeConfig) {
         nodeNameList.push({
           type: nodeConfig.type,
           enable: nodeConfig.enable,
           nodeName: nodeConfig.nodeName,
+          provider: nodeConfig.provider,
         });
         nodeList.push(nodeConfig);
       }
     });
   });
 
-  return templateEngine.renderString(tplBuffer.toString(), {
-    downloadUrl: getDownloadUrl(config.urlBase, artifactName),
+  const renderContext = {
+    proxyTestUrl: config.proxyTestUrl,
+    downloadUrl: getDownloadUrl(config.urlBase, artifactName, true, gatewayHasToken ? gatewayConfig.accessToken : undefined),
     nodes: nodeList,
     names: nodeNameList,
-    remoteSnippets: _.keyBy(remoteSnippetList, item => {
-      return item.name;
-    }),
+    remoteSnippets: _.keyBy(remoteSnippetList, item => item.name),
     nodeList,
-    provider,
-    providerName: provider,
+    provider: artifact.provider,
+    providerName: artifact.provider,
     artifactName,
-    getDownloadUrl: (name: string) => getDownloadUrl(config.urlBase, name),
+    getDownloadUrl: (name: string) => getDownloadUrl(config.urlBase, name, true, gatewayHasToken ? gatewayConfig.accessToken : undefined),
     getNodeNames,
-    getClashNodes,
     getClashNodeNames,
+    getClashNodes,
     getSurgeNodes,
     getShadowsocksNodes,
     getShadowsocksNodesJSON,
     getShadowsocksrNodes,
     getQuantumultNodes,
+    getV2rayNNodes,
+    getQuantumultXNodes,
+    getMellowNodes,
     usFilter,
     hkFilter,
+    japanFilter,
+    koreaFilter,
+    singaporeFilter,
+    taiwanFilter,
     toUrlSafeBase64,
     toBase64,
     encodeURIComponent,
-    ...customFilters,
-    ...(customParams ? customParams : {}),
+    netflixFilter,
+    youtubePremiumFilter,
+    customFilters,
+    customParams: customParams || {},
     ...(artifact.proxyGroupModifier ? {
       clashProxyConfig: {
         Proxy: getClashNodes(nodeList),
         'Proxy Group': normalizeClashProxyGroupConfig(
           nodeList,
           {
-            hkFilter,
             usFilter,
+            hkFilter,
+            japanFilter,
+            koreaFilter,
+            singaporeFilter,
+            taiwanFilter,
+            netflixFilter,
+            youtubePremiumFilter,
             ...customFilters,
           },
-          artifact.proxyGroupModifier
+          artifact.proxyGroupModifier,
+          {
+            proxyTestUrl: config.proxyTestUrl,
+            proxyTestInterval: config.proxyTestInterval,
+          },
         ),
       },
     } : {}),
-  });
+  };
+
+  if (templateString) {
+    return templateEngine.renderString(templateString, renderContext);
+  }
+  return templateEngine.render(`${template}.tpl`, renderContext);
 }
 
 export default async function(config: CommandConfig): Promise<void> {
-  console.log(chalk.cyan('Start generating configs.'));
+  console.log(chalk.cyan('开始生成规则'));
   await run(config)
     .catch(err => {
-      spinner.fail();
+      if (spinner.isSpinning) {
+        spinner.fail();
+      }
       throw err;
     });
-  console.log(chalk.cyan('Configs generated successfully.'));
+  console.log(chalk.cyan('规则生成成功'));
 }
